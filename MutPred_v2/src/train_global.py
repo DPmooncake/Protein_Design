@@ -7,6 +7,7 @@ train_mutpred_v2.py
     模型输入为:
         - 结构/类型节点特征 x (来自 build_graphs.py),
         - ESM 残基级别 embedding x_esm,
+        - 节点坐标 pos (用于 EGNN 坐标更新),
         - 边索引 edge_index 及边特征 edge_attr。
     模型输出为每个节点对 20 种氨基酸的 logits (20 维, 对应 20 种标准氨基酸)。
 
@@ -37,18 +38,6 @@ batch 处理:
         save-dir/loss_curve.png, save-dir/acc_curve.png
 
 调用格式示例:
-    # 口袋图 + 口袋监督
-    python src/train_mutpred_v2.py \
-        --graph-dir data/graphs_pocket \
-        --save-dir results/mutpred_v2_ckpt/pocket_100 \
-        --epochs 100 \
-        --batch-size 32 \
-        --mask-ratio 0.15 \
-        --lr 1e-3 \
-        --weight-decay 1e-4 \
-        --num-workers 2 \
-        --mask-mode pocket
-
     # 全局图 + 口袋监督
     python src/train_global.py \
         --graph-dir data/graphs_global \
@@ -63,14 +52,14 @@ batch 处理:
 
     # 全局图 + 全局监督
     python src/train_global.py \
-        --graph-dir data/graphs_global \
-        --save-dir results/mutpred_v2_ckpt/global_graph_global_mask_300 \
-        --epochs 300 \
+        --graph-dir data/graphs/global_k16 \
+        --save-dir results/mutpred_v2_ckpt/global_graph_global_mask_egnn_100 \
+        --epochs 100 \
         --batch-size 4 \
         --mask-ratio 0.15 \
-        --lr 1e-3 \
+        --lr 1e-4 \
         --weight-decay 1e-4 \
-        --num-workers 4 \
+        --num-workers 2 \
         --mask-mode global
 """
 
@@ -305,6 +294,12 @@ def train_one_epoch(
     mask_ratio: float,
     mask_mode: str,
 ) -> float:
+    """
+    单轮训练:
+        - 从 batch 中取出 x, x_esm, pos, edge_index, edge_attr 等;
+        - 根据 mask_mode 构建标签并随机掩码一部分节点;
+        - 使用模型前向得到 logits, 计算 cross_entropy 损失并反向更新。
+    """
     model.train()
     total_loss = 0.0
     total_nodes = 0
@@ -314,6 +309,7 @@ def train_one_epoch(
         x_esm = graph["x_esm"].to(device)
         edge_index = graph["edge_index"].to(device)
         edge_attr = graph["edge_attr"].to(device)
+        pos = graph["pos"].to(device)  # >>> EGNN 需要的坐标信息 <<<
         node_type = graph["node_type"].to(device)
         pocket_mask = graph["pocket_mask"].to(device)
 
@@ -330,7 +326,8 @@ def train_one_epoch(
         if num_supervised == 0:
             continue
 
-        logits = model(x, x_esm, edge_index, edge_attr)
+        # 注意: 这里调用 EGNN 版 MutPredV2Model, 需要传入 pos
+        logits = model(x, x_esm, edge_index, edge_attr, pos)
         loss = F.cross_entropy(logits, masked_labels, ignore_index=-100)
 
         optimizer.zero_grad()
@@ -352,6 +349,11 @@ def evaluate(
     mask_ratio: float,
     mask_mode: str,
 ) -> Tuple[float, float]:
+    """
+    验证:
+        - 与 train_one_epoch 类似, 但不做参数更新;
+        - 返回平均 loss 和 masked 位置的准确率。
+    """
     model.eval()
     total_loss = 0.0
     total_nodes = 0
@@ -362,6 +364,7 @@ def evaluate(
         x_esm = graph["x_esm"].to(device)
         edge_index = graph["edge_index"].to(device)
         edge_attr = graph["edge_attr"].to(device)
+        pos = graph["pos"].to(device)  # >>> EGNN 需要的坐标信息 <<<
         node_type = graph["node_type"].to(device)
         pocket_mask = graph["pocket_mask"].to(device)
 
@@ -378,7 +381,7 @@ def evaluate(
         if num_supervised == 0:
             continue
 
-        logits = model(x, x_esm, edge_index, edge_attr)
+        logits = model(x, x_esm, edge_index, edge_attr, pos)
         loss = F.cross_entropy(logits, masked_labels, ignore_index=-100)
 
         total_loss += loss.item() * num_supervised
@@ -479,7 +482,7 @@ def main():
     parser.add_argument(
         "--num-workers",
         type=int,
-        default=4,
+        default=2,
         help="DataLoader 的 num_workers (建议 >0 以提高数据加载速度)",
     )
     parser.add_argument(
