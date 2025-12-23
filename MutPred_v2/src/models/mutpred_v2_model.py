@@ -17,7 +17,7 @@
 #           num_classes=20,
 #       )
 #
-#   - 前向调用:
+#   - 自监督前向 (masked AA):
 #       logits = model(
 #           x_struct=graph["x"],            # [N, F_struct]
 #           x_esm=graph["x_esm"],           # [N, D_esm]
@@ -26,8 +26,20 @@
 #           pos=graph["pos"],               # [N, 3]
 #       )
 #
+#   - 获取节点表示 (用于湿实验监督头):
+#       logits, h = model.forward_with_repr(
+#           x_struct=graph["x"],
+#           x_esm=graph["x_esm"],
+#           edge_index=graph["edge_index"],
+#           edge_attr=graph["edge_attr"],
+#           pos=graph["pos"],
+#       )
+#
 # 输出:
-#   - logits: FloatTensor [N, num_classes], 每个节点对 20 种氨基酸的预测 logits, 供交叉熵损失使用。
+#   - forward: logits: FloatTensor [N, num_classes]
+#   - forward_with_repr: (logits, h)
+#       logits: [N, num_classes]
+#       h:      [N, hidden_dim]  final_norm 之后、head 之前的节点 embedding
 
 from typing import Tuple
 
@@ -113,7 +125,6 @@ class EGNNLayer(nn.Module):
         dist2 = torch.clamp(dist2, min=0.0, max=1000.0)
 
         # 单位方向向量 u_ij, 防止步长随距离线性放大
-        # 注意 dist2 形状为 [E,1], 因此开方后可以安全广播
         direction = diff / (torch.sqrt(dist2 + 1e-8))
 
         # 计算边消息 m_ij
@@ -153,6 +164,9 @@ class MutPredV2Model(nn.Module):
         2) 使用 per-node 门控网络计算 gate ∈ (0,1), 决定结构/ESM 的相对权重;
         3) 以融合后的 h0 和 pos 为输入, 通过多层 EGNNLayer 做消息传递与坐标更新;
         4) 最后通过 LayerNorm + 线性层输出 20 维氨基酸 logits。
+
+    额外接口:
+        - forward_with_repr: 在 forward 基础上同时返回节点 embedding h。
     """
 
     def __init__(
@@ -202,14 +216,20 @@ class MutPredV2Model(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.head = nn.Linear(hidden_dim, num_classes)
 
-    def forward(
+    def _encode(
         self,
-        x_struct: torch.Tensor,     # [N, F_struct]
-        x_esm: torch.Tensor,        # [N, D_esm]
-        edge_index: torch.Tensor,   # [2, E]
-        edge_attr: torch.Tensor,    # [E, F_edge]
-        pos: torch.Tensor,          # [N, 3]
-    ) -> torch.Tensor:
+        x_struct: torch.Tensor,
+        x_esm: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        内部编码函数:
+            输入结构特征、ESM 特征和图结构, 返回:
+                - h:       [N, hidden_dim]  (final_norm 之后)
+                - cur_pos: [N, 3]           更新后的坐标
+        """
         # 1) 结构特征投影
         h_struct = self.struct_proj(x_struct)  # [N, H]
 
@@ -233,7 +253,39 @@ class MutPredV2Model(nn.Module):
             h, cur_pos = layer(h, cur_pos, edge_index, edge_attr)
             h = self.dropout(h)
 
-        # 5) 归一化 + 分类头
+        # 5) 归一化
         h = self.final_norm(h)
+        return h, cur_pos
+
+    def forward(
+        self,
+        x_struct: torch.Tensor,     # [N, F_struct]
+        x_esm: torch.Tensor,        # [N, D_esm]
+        edge_index: torch.Tensor,   # [2, E]
+        edge_attr: torch.Tensor,    # [E, F_edge]
+        pos: torch.Tensor,          # [N, 3]
+    ) -> torch.Tensor:
+        """
+        自监督 masked AA 任务使用的前向接口: 仅返回 logits。
+        """
+        h, _ = self._encode(x_struct, x_esm, edge_index, edge_attr, pos)
         logits = self.head(h)  # [N, num_classes]
         return logits
+
+    def forward_with_repr(
+        self,
+        x_struct: torch.Tensor,     # [N, F_struct]
+        x_esm: torch.Tensor,        # [N, D_esm]
+        edge_index: torch.Tensor,   # [2, E]
+        edge_attr: torch.Tensor,    # [E, F_edge]
+        pos: torch.Tensor,          # [N, 3]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        用于湿实验监督头的前向接口:
+            返回:
+                logits: [N, num_classes]
+                h:      [N, hidden_dim]  (final_norm 之后、head 之前的节点 embedding)
+        """
+        h, _ = self._encode(x_struct, x_esm, edge_index, edge_attr, pos)
+        logits = self.head(h)
+        return logits, h

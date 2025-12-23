@@ -1,3 +1,8 @@
+# 作用: 从 holo PDB + ESM-2 embedding 构建用于 EGNN 的全局/口袋异质图(pt)
+# 输入: --pdb_dir, --esm_dir, --out_graph_dir, --sub_resname, --tpp_resname, --graph_mode 等(详见 argparse)
+# 输出: out_graph_dir/{uid}.pt (包含 pos/x/x_esm/edge_index/edge_attr/pocket_mask 等字段)
+# 调用: python src/embedding/build_graphs_global.py --pdb_dir ... --esm_dir ... --out_graph_dir ... --graph_mode global
+
 """
 build_graphs_global.py
 
@@ -123,6 +128,19 @@ build_graphs_global.py
         --prot_lig_cutoff 5.0 \
         --batch_size 16
 
+    python src/embedding/build_graphs_global.py \
+        --pdb_dir data/test/pdbs \
+        --esm_dir data/test/sequence_features \
+        --out_graph_dir data/test/graphs \
+        --sub_resname l02 \
+        --tpp_resname l01 \
+        --core_cutoff 4.5 \
+        --contact_cutoff 5.0 \
+        --shell_hops 1 \
+        --graph_mode global \
+        --protein_cutoff 16 \
+        --prot_lig_cutoff 5.0 \
+        --batch_size 16
 
 """
 
@@ -172,18 +190,6 @@ def one_hot(index: int, dim: int) -> np.ndarray:
     if 0 <= index < dim:
         v[index] = 1.0
     return v
-
-
-def rbf_encode(dist: np.ndarray, K: int = 16, dmax: float = 15.0) -> np.ndarray:
-    """
-    标量距离 -> RBF 特征
-    当前版本 edge_attr 已不再使用 RBF 编码,
-    该函数仅保留以备后续可能需要。
-    """
-    centers = np.linspace(0.0, dmax, K, dtype=np.float32)
-    gamma = 1.0 / ((centers[1] - centers[0]) ** 2 + 1e-8)
-    diff = dist[..., None] - centers[None, ...]
-    return np.exp(-gamma * diff ** 2).astype(np.float32)
 
 
 def atoms_center(atoms) -> Optional[np.ndarray]:
@@ -479,7 +485,7 @@ def build_pdb_seq_and_keys(residues: List[Dict]) -> Tuple[str, List[Tuple[str, i
         if resname not in AA_TYPES_3:
             continue
         idx = AA_TYPES_3[resname]
-        aa_char = "ARNDCEQGHILKMFPSTWYV"[idx]
+        aa_char = "ARNDCQEGHILKMFPSTWYV"[idx]
         seq_chars.append(aa_char)
         keys.append((cid, resseq, icode))
     seq_str = "".join(seq_chars)
@@ -608,8 +614,6 @@ def build_graph_for_uid(uid: str,
                         tpp_resname: str,
                         protein_cutoff: float,
                         prot_lig_cutoff: float,
-                        rbf_k: int,
-                        rbf_max_dist: float,
                         esm_residue_emb: np.ndarray,
                         esm_mapping: Dict[Tuple[str, int, str], int],
                         core_cutoff: float = 5.0,
@@ -623,7 +627,6 @@ def build_graph_for_uid(uid: str,
       - protein_cutoff: 用作蛋白-蛋白 kNN 的近邻个数 k (向上取整), 不再作为距离阈值;
       - prot_lig_cutoff: 蛋白-底物/TPP/Mg 的聚边距离阈值;
       - core_cutoff / shell_hops / contact_cutoff: 控制 pocket core/shell 识别;
-      - rbf_k, rbf_max_dist: 当前 edge_attr 不再使用 RBF, 仅保留参数以兼容旧接口。
     """
     if not residues:
         print(f"[WARN] {uid}: no protein residues, skip graph.")
@@ -1001,10 +1004,6 @@ def main():
                     help="蛋白-蛋白 kNN 的近邻个数 k (向上取整, 不再作为距离阈值)")
     ap.add_argument("--prot_lig_cutoff", type=float, default=5.0,
                     help="蛋白-配体/TPP/Mg 聚边距离阈值 (Å)")
-    ap.add_argument("--rbf_k", type=int, default=16,
-                    help="RBF 维数 (当前版本未使用, 仅保留接口兼容)")
-    ap.add_argument("--rbf_max_dist", type=float, default=15.0,
-                    help="RBF 最大距离 (当前版本未使用, 仅保留接口兼容)")
 
     ap.add_argument("--graph_mode", type=str, default="pocket",
                     choices=["pocket", "global"],
@@ -1080,8 +1079,6 @@ def main():
                 tpp_resname=args.tpp_resname,
                 protein_cutoff=args.protein_cutoff,
                 prot_lig_cutoff=args.prot_lig_cutoff,
-                rbf_k=args.rbf_k,
-                rbf_max_dist=args.rbf_max_dist,
                 esm_residue_emb=esm_residue_emb,
                 esm_mapping=esm_mapping,
                 core_cutoff=args.core_cutoff,
