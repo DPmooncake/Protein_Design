@@ -28,6 +28,12 @@ python src/embedding/extract_esm2_embedding.py \
     --repr-layer 36 \
     --batch-size 4
 
+python src/embedding/extract_esm2_embedding.py \
+    --fasta data/test/paper_data.fasta \
+    --out-dir data/test/sequence_features \
+    --model-name esm2_t36_3B_UR50D \
+    --repr-layer 36 \
+    --batch-size 4
 """
 
 import os

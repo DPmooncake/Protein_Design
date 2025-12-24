@@ -1,652 +1,608 @@
 # -*- coding: utf-8 -*-
+# predict.py
+#
+# 作用:
+#   使用训练好的 MutPred_v2(EGNN) 模型对单个 holo PDB 结构进行逐位点打分与氨基酸替换建议。
+#   对每个待评估蛋白残基 i:
+#     1) 将该位点的 AA one-hot(前20维) 与 x_esm 清零(mask);
+#     2) 使用模型前向得到该位点 20aa 的 logits/logP;
+#     3) 计算 score = logP(best_alt) - logP(wt)，并输出 top-k 氨基酸概率。
+#
+# 输入:
+#   --pdb:        单个 holo PDB 文件路径(蛋白 + 底物 + TPP + Mg)
+#   --checkpoint: checkpoint 路径(支持两种格式)
+#       1) 自监督预训练 ckpt:   {"model_state": state_dict, ...}
+#       2) 湿实验监督 ckpt:     {"backbone_state": state_dict, "wet_head_state": ..., ...}
+#   --state-key:  指定从 ckpt 中取哪一个 state_dict
+#       - auto(默认): 优先 backbone_state，其次 model_state，最后尝试把 ckpt 本身当作 state_dict
+#       - backbone_state: 强制使用 backbone_state
+#       - model_state:    强制使用 model_state
+#   --out-dir:    输出 CSV 的文件夹
+#   --graph-mode: pocket/global (与构图一致；一般建议 global)
+#   --score-scope: pocket/global
+#       pocket: 只对 pocket_mask 标记的蛋白残基打分
+#       global: 对所有蛋白残基打分（用于捕获远端突变）
+#
+# 输出:
+#   {out-dir}/{pdbname}_mut_suggest.csv
+#
+# 调用示例:
 """
-train_mutpred_v2.py
-
-作用:
-    使用口袋/全局图 .pt 文件训练 MutPred_v2 自监督模型, 任务为 masked amino-acid 预测。
-    模型输入为:
-        - 结构/类型节点特征 x (来自 build_graphs.py),
-        - ESM 残基级别 embedding x_esm,
-        - 边索引 edge_index 及边特征 edge_attr。
-    模型输出为每个节点对 20 种氨基酸的 logits (20 维, 对应 20 种标准氨基酸)。
-
-数据划分:
-    - 对 graph_dir 中的所有 {uid}.pt 做 train/val/test 划分 (按 uid 划分);
-    - 若 split_dir 下已存在 train.txt / val.txt / test.txt, 则直接读取并复用该划分;
-    - 若不存在, 则根据给定随机种子生成一次划分并写入上述三个 txt 文件以便复现。
-
-batch 处理:
-    - 使用 collate_graphs 将一批图拼接成一个“大图”:
-        - 节点特征按节点维拼接;
-        - 边索引加节点 offset 后按边维拼接;
-        - 新增 "batch" 向量记录每个节点属于哪个子图 (当前未使用)。
-
-新增功能:
-    - 掩码/监督模式 mask_mode:
-        * "pocket": 仅在蛋白 pocket 节点上构建标签与掩码 (原始行为);
-        * "global": 在所有蛋白节点上构建标签与掩码 (全局随机 mask)。
-
-输出:
-    - split_dir/train.txt, val.txt, test.txt: 每行一个 uid, 对应 {uid}.pt;
-    - 训练过程中仅保存一个最佳模型:
-        save-dir 下:
-        - mutpred_v2_best.pt (包含 model_state 等信息)。
-    - 训练日志:
-        save-dir/training_log.csv, 每行包含 epoch, train_loss, val_loss, val_acc;
-    - 训练曲线:
-        save-dir/loss_curve.png, save-dir/acc_curve.png
-
-调用格式示例:
-    # 口袋图 + 口袋监督
-    python src/train_mutpred_v2.py \
-        --graph-dir data/graphs_pocket \
-        --save-dir results/mutpred_v2_ckpt/pocket_100 \
-        --epochs 100 \
-        --batch-size 32 \
-        --mask-ratio 0.15 \
-        --lr 1e-3 \
-        --weight-decay 1e-4 \
-        --num-workers 2 \
-        --mask-mode pocket
-
-    # 全局图 + 口袋监督
-    python src/train_global.py \
-        --graph-dir data/graphs_global \
-        --save-dir results/mutpred_v2_ckpt/global_graph_pocket_mask_100 \
-        --epochs 100 \
-        --batch-size 2 \
-        --mask-ratio 0.15 \
-        --lr 1e-3 \
-        --weight-decay 1e-4 \
-        --num-workers 2 \
-        --mask-mode pocket
-
-    # 全局图 + 全局监督
-    python src/train_global.py \
-        --graph-dir data/graphs_global \
-        --save-dir results/mutpred_v2_ckpt/global_graph_global_mask_300 \
-        --epochs 300 \
-        --batch-size 4 \
-        --mask-ratio 0.15 \
-        --lr 1e-3 \
-        --weight-decay 1e-4 \
-        --num-workers 4 \
-        --mask-mode global
+python src/predict.py \
+    --pdb data/val/pdbs/1MCZ_2_ketopentanoate.pdb \
+    --checkpoint results/wet_head_ckpt/egnn_100/mutpred_v2_wet_best.pt \
+    --state-key backbone_state \
+    --out-dir results/mutpred_v2_pred/egnn_test \
+    --graph-mode global \
+    --score-scope global \
+    --top-sites 30 \
+    --top-k-aa 5
 """
 
 import os
 import argparse
-from typing import List, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
-import matplotlib.pyplot as plt
+import numpy as np
+import esm
+from Bio.PDB import PDBParser
 
 from models.mutpred_v2_model import MutPredV2Model
+from embedding.build_graphs_global import (
+    collect_protein_residues,
+    identify_pocket_residues,
+    build_pdb_to_esm_mapping,
+    build_graph_for_uid,
+)
 
-# 必须与构图脚本保持一致
+# 你已确认 AA 顺序无问题：这里不再改动你的顺序假设
+AA_TYPES_1 = [
+    "A", "R", "N", "D", "C",
+    "Q", "E", "G", "H", "I",
+    "L", "K", "M", "F", "P",
+    "S", "T", "W", "Y", "V",
+]
 AA_DIM = 20
-NODE_TYPE_PROTEIN = 0  # build_graphs.py 中 NODE_TYPE_MAP["protein"] 的值
+NODE_TYPE_PROTEIN = 0  # 与构图脚本一致
 
 
-class PocketGraphDataset(Dataset):
+def _extract_state_dict(ckpt: Any, state_key: str) -> Dict[str, torch.Tensor]:
     """
-    基于 uid 列表的图数据集:
-        - graph_dir 下存放若干 {uid}.pt;
-        - uid_list 中的每个 uid 对应一个样本。
+    作用:
+        从 checkpoint 中提取 backbone 的 state_dict，兼容:
+          - {"model_state": ...}
+          - {"backbone_state": ...}
+          - 直接就是 state_dict
+    输入:
+        ckpt: torch.load() 得到的对象
+        state_key: auto / backbone_state / model_state
+    输出:
+        state_dict
     """
+    if isinstance(ckpt, dict):
+        if state_key != "auto":
+            if state_key not in ckpt:
+                raise KeyError(f"checkpoint 不包含 key='{state_key}'，可用 keys={list(ckpt.keys())}")
+            state = ckpt[state_key]
+            if not isinstance(state, dict):
+                raise TypeError(f"ckpt['{state_key}'] 不是 dict(state_dict)，实际类型={type(state)}")
+            return state
 
-    def __init__(self, graph_dir: str, uid_list: List[str]):
-        super().__init__()
-        self.graph_dir = graph_dir
-        self.uids = uid_list
-        if len(self.uids) == 0:
-            raise RuntimeError(f"数据集为空: {graph_dir}")
+        # auto: 优先 backbone_state，其次 model_state
+        if "backbone_state" in ckpt and isinstance(ckpt["backbone_state"], dict):
+            return ckpt["backbone_state"]
+        if "model_state" in ckpt and isinstance(ckpt["model_state"], dict):
+            return ckpt["model_state"]
 
-    def __len__(self) -> int:
-        return len(self.uids)
+        # 有些人会把整个 ckpt 直接存 state_dict：尝试判断
+        if all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            return ckpt
 
-    def __getitem__(self, idx: int):
-        uid = self.uids[idx]
-        path = os.path.join(self.graph_dir, uid + ".pt")
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"图文件不存在: {path}")
-        graph = torch.load(path)
-        graph["uid"] = uid
-        return graph
+        raise KeyError(
+            "无法从 checkpoint 提取模型参数。"
+            "期望包含 'backbone_state' 或 'model_state'，或 checkpoint 本身就是 state_dict。"
+        )
+
+    # 不是 dict：不支持
+    raise TypeError(f"不支持的 checkpoint 类型: {type(ckpt)}")
 
 
-def collate_graphs(batch: List[dict]) -> dict:
+def _infer_model_hparams_from_state(state: Dict[str, torch.Tensor]) -> Tuple[int, int, int, int, int]:
     """
-    将一批图 (list[graph_dict]) 拼接成一个大图, 支持 batch_size > 1 的训练。
-
-    输入每个 graph 包含字段:
-        - x:             [N_i, F_struct]
-        - x_esm:         [N_i, D_esm]
-        - node_type:     [N_i]
-        - pocket_mask:   [N_i]
-        - pos:           [N_i, 3]
-        - node_chain_idx:[N_i]
-        - node_resseq:   [N_i]
-        - edge_index:    [2, E_i]
-        - edge_attr:     [E_i, F_edge]
-        - prot_node_idx: List[int]
-        - sub_node_idx:  List[int]
-        - tpp_node_idx:  List[int]
-        - mg_node_idx:   List[int]
-
-    输出 merged_graph:
-        同上字段, 但所有节点/边已拼接, 并新增:
-        - batch: [N_total], 每个元素为该节点属于的子图 id (0..B-1)。
+    作用:
+        从 state_dict 推断 (struct_dim, esm_dim, edge_dim, hidden_dim, num_layers)
+    说明:
+        兼容两种命名体系:
+          1) 新版 MutPredV2Model: struct_proj/esm_proj/layers.{i}.edge_mlp
+          2) 旧版命名: lin_struct/lin_esm/layers.{i}.msg_mlp
     """
-    import torch as _torch
-
-    node_feats_list = []
-    node_esm_list = []
-    node_type_list = []
-    pocket_mask_list = []
-    pos_list = []
-    node_chain_idx_list = []
-    node_resseq_list = []
-
-    edge_index_list = []
-    edge_attr_list = []
-
-    prot_idx_list = []
-    sub_idx_list = []
-    tpp_idx_list = []
-    mg_idx_list = []
-
-    batch_id_list = []
-
-    node_offset = 0
-    for b_id, g in enumerate(batch):
-        x = g["x"]
-        x_esm = g["x_esm"]
-        node_type = g["node_type"]
-        pocket_mask = g["pocket_mask"]
-        pos = g["pos"]
-        node_chain_idx = g["node_chain_idx"]
-        node_resseq = g["node_resseq"]
-
-        edge_index = g["edge_index"]
-        edge_attr = g["edge_attr"]
-
-        N_i = x.size(0)
-
-        node_feats_list.append(x)
-        node_esm_list.append(x_esm)
-        node_type_list.append(node_type)
-        pocket_mask_list.append(pocket_mask)
-        pos_list.append(pos)
-        node_chain_idx_list.append(node_chain_idx)
-        node_resseq_list.append(node_resseq)
-
-        batch_id_list.append(_torch.full((N_i,), b_id, dtype=_torch.long))
-
-        ei = edge_index + node_offset
-        edge_index_list.append(ei)
-        edge_attr_list.append(edge_attr)
-
-        prot_idx_list.append([idx + node_offset for idx in g["prot_node_idx"]])
-        sub_idx_list.append([idx + node_offset for idx in g["sub_node_idx"]])
-        tpp_idx_list.append([idx + node_offset for idx in g.get("tpp_node_idx", [])])
-        mg_idx_list.append([idx + node_offset for idx in g.get("mg_node_idx", [])])
-
-        node_offset += N_i
-
-    merged = {
-        "x": _torch.cat(node_feats_list, dim=0),
-        "x_esm": _torch.cat(node_esm_list, dim=0),
-        "node_type": _torch.cat(node_type_list, dim=0),
-        "pocket_mask": _torch.cat(pocket_mask_list, dim=0),
-        "pos": _torch.cat(pos_list, dim=0),
-        "node_chain_idx": _torch.cat(node_chain_idx_list, dim=0),
-        "node_resseq": _torch.cat(node_resseq_list, dim=0),
-        "edge_index": _torch.cat(edge_index_list, dim=1),
-        "edge_attr": _torch.cat(edge_attr_list, dim=0),
-        "prot_node_idx": sum(prot_idx_list, []),
-        "sub_node_idx": sum(sub_idx_list, []),
-        "tpp_node_idx": sum(tpp_idx_list, []),
-        "mg_node_idx": sum(mg_idx_list, []),
-        "batch": _torch.cat(batch_id_list, dim=0),
-    }
-    return merged
-
-
-def build_labels_from_x_pocket(
-    x: torch.Tensor,
-    node_type: torch.Tensor,
-    pocket_mask: torch.Tensor,
-) -> torch.Tensor:
-    """
-    口袋监督版本:
-        - 假定 x 的前 AA_DIM 维为 20 种氨基酸 one-hot;
-        - 仅在蛋白且属于 pocket 的节点上有有效标签;
-        - 其它节点标签设为 -100, 以便 cross_entropy(ignore_index=-100) 忽略。
-    """
-    aa_onehot = x[:, :AA_DIM]
-    aa_idx = aa_onehot.argmax(dim=-1)  # 0..19
-
-    labels = torch.full_like(aa_idx, fill_value=-100)
-    is_protein = (node_type == NODE_TYPE_PROTEIN)
-    valid = is_protein & pocket_mask
-    labels[valid] = aa_idx[valid]
-    return labels
-
-
-def build_labels_from_x_global(
-    x: torch.Tensor,
-    node_type: torch.Tensor,
-) -> torch.Tensor:
-    """
-    全局监督版本:
-        - 同样从 x 的前 AA_DIM 维恢复氨基酸;
-        - 所有蛋白节点 (node_type == NODE_TYPE_PROTEIN) 都有标签;
-        - 其他节点标签为 -100。
-    """
-    aa_onehot = x[:, :AA_DIM]
-    aa_idx = aa_onehot.argmax(dim=-1)
-
-    labels = torch.full_like(aa_idx, fill_value=-100)
-    is_protein = (node_type == NODE_TYPE_PROTEIN)
-    labels[is_protein] = aa_idx[is_protein]
-    return labels
-
-
-def apply_random_mask(
-    x: torch.Tensor,
-    x_esm: torch.Tensor,
-    labels: torch.Tensor,
-    mask_ratio: float,
-) -> torch.Tensor:
-    """
-    在有效监督节点 (labels != -100) 中随机掩码一部分, 并返回仅在被掩码位置保留的标签。
-
-    掩码策略:
-        - 有效监督节点: labels != -100;
-        - 在这些节点上以 mask_ratio 的概率进行掩码;
-        - 对被掩码节点:
-            - x 前 20 维 (氨基酸 one-hot) 置 0;
-            - x_esm 置 0;
-        - masked_labels 在被掩码位置等于原始标签, 其它位置为 -100。
-    """
-    device = x.device
-    N = x.size(0)
-
-    valid = (labels != -100)
-    num_valid = int(valid.sum().item())
-    if num_valid == 0:
-        return torch.full_like(labels, fill_value=-100)
-
-    rand = torch.rand(N, device=device)
-    mask = (rand < mask_ratio) & valid
-
-    if mask.sum().item() == 0:
-        valid_idx = valid.nonzero(as_tuple=False).view(-1)
-        rand_idx = valid_idx[torch.randint(len(valid_idx), (1,))]
-        mask[rand_idx] = True
-
-    x[:, :AA_DIM][mask] = 0.0
-    x_esm[mask] = 0.0
-
-    masked_labels = torch.full_like(labels, fill_value=-100)
-    masked_labels[mask] = labels[mask]
-    return masked_labels
-
-
-def train_one_epoch(
-    model: MutPredV2Model,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    mask_ratio: float,
-    mask_mode: str,
-) -> float:
-    model.train()
-    total_loss = 0.0
-    total_nodes = 0
-
-    for graph in tqdm(loader, desc="Train", leave=False):
-        x = graph["x"].to(device)
-        x_esm = graph["x_esm"].to(device)
-        edge_index = graph["edge_index"].to(device)
-        edge_attr = graph["edge_attr"].to(device)
-        node_type = graph["node_type"].to(device)
-        pocket_mask = graph["pocket_mask"].to(device)
-
-        if mask_mode == "pocket":
-            labels = build_labels_from_x_pocket(x, node_type, pocket_mask)
-        elif mask_mode == "global":
-            labels = build_labels_from_x_global(x, node_type)
-        else:
-            raise ValueError(f"未知 mask_mode: {mask_mode}")
-
-        masked_labels = apply_random_mask(x, x_esm, labels, mask_ratio)
-
-        num_supervised = (masked_labels != -100).sum().item()
-        if num_supervised == 0:
-            continue
-
-        logits = model(x, x_esm, edge_index, edge_attr)
-        loss = F.cross_entropy(logits, masked_labels, ignore_index=-100)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item() * num_supervised
-        total_nodes += num_supervised
-
-    avg_loss = total_loss / max(total_nodes, 1)
-    return avg_loss
-
-
-@torch.no_grad()
-def evaluate(
-    model: MutPredV2Model,
-    loader: DataLoader,
-    device: torch.device,
-    mask_ratio: float,
-    mask_mode: str,
-) -> Tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_nodes = 0
-    total_correct = 0
-
-    for graph in tqdm(loader, desc="Val", leave=False):
-        x = graph["x"].to(device)
-        x_esm = graph["x_esm"].to(device)
-        edge_index = graph["edge_index"].to(device)
-        edge_attr = graph["edge_attr"].to(device)
-        node_type = graph["node_type"].to(device)
-        pocket_mask = graph["pocket_mask"].to(device)
-
-        if mask_mode == "pocket":
-            labels = build_labels_from_x_pocket(x, node_type, pocket_mask)
-        elif mask_mode == "global":
-            labels = build_labels_from_x_global(x, node_type)
-        else:
-            raise ValueError(f"未知 mask_mode: {mask_mode}")
-
-        masked_labels = apply_random_mask(x, x_esm, labels, mask_ratio)
-
-        num_supervised = (masked_labels != -100).sum().item()
-        if num_supervised == 0:
-            continue
-
-        logits = model(x, x_esm, edge_index, edge_attr)
-        loss = F.cross_entropy(logits, masked_labels, ignore_index=-100)
-
-        total_loss += loss.item() * num_supervised
-        total_nodes += num_supervised
-
-        preds = logits.argmax(dim=-1)
-        correct = (preds == masked_labels) & (masked_labels != -100)
-        total_correct += correct.sum().item()
-
-    avg_loss = total_loss / max(total_nodes, 1)
-    avg_acc = total_correct / max(total_nodes, 1)
-    return avg_loss, avg_acc
-
-
-def make_or_load_splits(
-    graph_dir: str,
-    split_dir: str,
-    train_ratio: float = 0.8,
-    val_ratio: float = 0.1,
-    seed: int = 1234,
-) -> Tuple[List[str], List[str], List[str]]:
-    """
-    生成或读取 train/val/test 划分:
-        - 若 split_dir 下存在 train.txt, val.txt, test.txt, 则直接读取 uid 列表;
-        - 否则对 graph_dir 下所有 {uid}.pt 根据比例随机划分一次并写入 txt。
-    """
-    os.makedirs(split_dir, exist_ok=True)
-    train_txt = os.path.join(split_dir, "train.txt")
-    val_txt = os.path.join(split_dir, "val.txt")
-    test_txt = os.path.join(split_dir, "test.txt")
-
-    def read_list(path: str) -> List[str]:
-        with open(path, "r") as f:
-            return [line.strip() for line in f if line.strip()]
-
-    def write_list(path: str, xs: List[str]) -> None:
-        with open(path, "w") as f:
-            for x in xs:
-                f.write(x + "\n")
-
-    if os.path.exists(train_txt) and os.path.exists(val_txt) and os.path.exists(test_txt):
-        train_uids = read_list(train_txt)
-        val_uids = read_list(val_txt)
-        test_uids = read_list(test_txt)
-        return train_uids, val_uids, test_uids
-
-    all_files = [f for f in os.listdir(graph_dir) if f.endswith(".pt")]
-    uids = [os.path.splitext(f)[0] for f in all_files]
-    uids.sort()
-
-    if len(uids) == 0:
-        raise RuntimeError(f"在 {graph_dir} 中未找到任何 .pt 图文件")
-
-    import random
-    rnd = random.Random(seed)
-    rnd.shuffle(uids)
-
-    n = len(uids)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    n_train = max(1, n_train)
-    n_val = max(1, n_val)
-    if n_train + n_val >= n:
-        n_train = max(1, n - 2)
-        n_val = 1
-
-    train_uids = uids[:n_train]
-    val_uids = uids[n_train:n_train + n_val]
-    test_uids = uids[n_train + n_val:]
-
-    write_list(train_txt, train_uids)
-    write_list(val_txt, val_uids)
-    write_list(test_txt, test_uids)
-
-    return train_uids, val_uids, test_uids
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Train MutPred_v2 self-supervised model")
-    parser.add_argument("--graph-dir", type=str, required=True, help="图 .pt 文件目录")
-    parser.add_argument("--save-dir", type=str, required=True, help="模型保存目录")
-    parser.add_argument(
-        "--split-dir",
-        type=str,
-        default=None,
-        help="划分 txt 保存目录; 若未指定, 默认为 graph_dir 的上一级目录下 splits/ 子目录",
-    )
-    parser.add_argument("--epochs", type=int, default=50, help="训练轮数")
-    parser.add_argument("--batch-size", type=int, default=4, help="batch 大小(图的数量)")
-    parser.add_argument("--mask-ratio", type=float, default=0.15, help="掩码比例")
-    parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="权重衰减")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="GNN 隐藏维度")
-    parser.add_argument("--num-layers", type=int, default=4, help="GNN 层数")
-    parser.add_argument("--train-ratio", type=float, default=0.8, help="训练集比例")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="验证集比例(剩余为测试集)")
-    parser.add_argument("--seed", type=int, default=1234, help="划分随机种子")
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="DataLoader 的 num_workers (建议 >0 以提高数据加载速度)",
-    )
-    parser.add_argument(
-        "--mask-mode",
-        type=str,
-        default="pocket",
-        choices=["pocket", "global"],
-        help="自监督掩码/监督范围: pocket=仅口袋蛋白节点; global=所有蛋白节点",
-    )
-    args = parser.parse_args()
-
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    # 默认的 split_dir: graph_dir 的上一级目录下的 splits 子目录
-    if args.split_dir is None:
-        graph_dir_abs = os.path.abspath(args.graph_dir)
-        parent = os.path.dirname(graph_dir_abs)  # 例如 data/graphs -> data
-        args.split_dir = os.path.join(parent, "splits")
-    os.makedirs(args.split_dir, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("使用设备:", device)
-
-    # 划分或读取已有划分
-    train_uids, val_uids, test_uids = make_or_load_splits(
-        graph_dir=args.graph_dir,
-        split_dir=args.split_dir,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-    )
-    print(f"Train: {len(train_uids)}, Val: {len(val_uids)}, Test: {len(test_uids)}")
-    print(f"划分文件位于: {args.split_dir}")
-
-    train_dataset = PocketGraphDataset(args.graph_dir, train_uids)
-    val_dataset = PocketGraphDataset(args.graph_dir, val_uids)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate_graphs,
-        num_workers=args.num_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        collate_fn=collate_graphs,
-        num_workers=args.num_workers,
-        pin_memory=True,
+    # 新版（与你发的 mutpred_v2_model.py 一致）
+    if "struct_proj.weight" in state and "esm_proj.weight" in state:
+        hidden_dim = int(state["struct_proj.weight"].shape[0])
+        struct_dim = int(state["struct_proj.weight"].shape[1])
+        esm_dim = int(state["esm_proj.weight"].shape[1])
+
+        # EGNNLayer: edge_mlp[0] = Linear(2H + 1 + edge_dim, H)
+        key0 = "layers.0.edge_mlp.0.weight"
+        if key0 not in state:
+            # 兜底：找任意一层
+            cand = [k for k in state.keys() if k.endswith(".edge_mlp.0.weight") and k.startswith("layers.")]
+            if not cand:
+                raise KeyError("在 state_dict 中找不到 layers.*.edge_mlp.0.weight，无法推断 edge_dim")
+            key0 = sorted(cand)[0]
+
+        in_dim = int(state[key0].shape[1])
+        edge_dim = in_dim - (2 * hidden_dim + 1)
+        if edge_dim <= 0:
+            raise ValueError(f"推断 edge_dim 失败: in_dim={in_dim}, hidden_dim={hidden_dim} -> edge_dim={edge_dim}")
+
+        # 推断 num_layers
+        layer_ids = set()
+        for k in state.keys():
+            if k.startswith("layers.") and k.endswith(".edge_mlp.0.weight"):
+                # layers.{i}.edge_mlp.0.weight
+                try:
+                    lid = int(k.split(".")[1])
+                    layer_ids.add(lid)
+                except Exception:
+                    continue
+        num_layers = max(layer_ids) + 1 if layer_ids else 0
+        if num_layers <= 0:
+            raise ValueError("推断 num_layers 失败：未找到 layers.{i}.edge_mlp.0.weight")
+
+        return struct_dim, esm_dim, edge_dim, hidden_dim, num_layers
+
+    # 旧版（兼容）
+    if "lin_struct.weight" in state and "lin_esm.weight" in state:
+        hidden_dim = int(state["lin_struct.weight"].shape[0])
+        struct_dim = int(state["lin_struct.weight"].shape[1])
+        esm_dim = int(state["lin_esm.weight"].shape[1])
+
+        key0 = "layers.0.msg_mlp.0.weight"
+        if key0 not in state:
+            cand = [k for k in state.keys() if k.endswith(".msg_mlp.0.weight") and k.startswith("layers.")]
+            if not cand:
+                raise KeyError("在 state_dict 中找不到 layers.*.msg_mlp.0.weight，无法推断 edge_dim")
+            key0 = sorted(cand)[0]
+
+        in_dim = int(state[key0].shape[1])
+        edge_dim = in_dim - hidden_dim
+        if edge_dim <= 0:
+            raise ValueError(f"推断 edge_dim 失败: in_dim={in_dim}, hidden_dim={hidden_dim} -> edge_dim={edge_dim}")
+
+        layer_ids = set()
+        for k in state.keys():
+            if k.startswith("layers.") and k.endswith(".msg_mlp.0.weight"):
+                try:
+                    lid = int(k.split(".")[1])
+                    layer_ids.add(lid)
+                except Exception:
+                    continue
+        num_layers = max(layer_ids) + 1 if layer_ids else 0
+        if num_layers <= 0:
+            raise ValueError("推断 num_layers 失败：未找到 layers.{i}.msg_mlp.0.weight")
+
+        return struct_dim, esm_dim, edge_dim, hidden_dim, num_layers
+
+    # 都不匹配：给出 keys 线索
+    sample_keys = list(state.keys())[:30]
+    raise KeyError(
+        "无法识别 state_dict 的命名体系：既没有 struct_proj/esm_proj，也没有 lin_struct/lin_esm。"
+        f"示例 keys={sample_keys}"
     )
 
-    sample_graph = train_dataset[0]
-    struct_dim = sample_graph["x"].shape[1]
-    esm_dim = sample_graph["x_esm"].shape[1]
-    edge_dim = sample_graph["edge_attr"].shape[1]
+
+def load_mutpred_model(ckpt_path: str, device: torch.device, state_key: str = "auto") -> MutPredV2Model:
+    """
+    作用:
+        加载 MutPredV2Model backbone，支持:
+          - 旧自监督 ckpt: model_state
+          - 新湿实验 ckpt: backbone_state
+    输入:
+        ckpt_path: checkpoint 路径
+        device: cpu/cuda
+        state_key: auto/backbone_state/model_state
+    输出:
+        MutPredV2Model (eval 模式)
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = _extract_state_dict(ckpt, state_key=state_key)
+
+    struct_dim, esm_dim, edge_dim, hidden_dim, num_layers = _infer_model_hparams_from_state(state)
 
     model = MutPredV2Model(
         struct_dim=struct_dim,
         esm_dim=esm_dim,
         edge_dim=edge_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
         num_classes=AA_DIM,
-    ).to(device)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
     )
 
-    best_val_loss = float("inf")
-    best_epoch = -1
-    best_path = os.path.join(args.save_dir, "mutpred_v2_best.pt")
+    # strict=False：允许 ckpt 中额外键（例如你未来加别的分支），也允许某些无关 buffer
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print("[WARN] 加载模型缺少参数:", missing)
+    if unexpected:
+        print("[WARN] 加载模型多余参数:", unexpected)
 
-    # 准备日志文件
-    log_path = os.path.join(args.save_dir, "training_log.csv")
-    with open(log_path, "w") as f:
-        f.write("epoch,train_loss,val_loss,val_acc\n")
+    model.to(device)
+    model.eval()
 
-    # 用于画图的历史记录
-    epoch_list = []
-    train_hist = []
-    val_hist = []
-    acc_hist = []
+    # 打印实际使用的 state key（便于对比实验）
+    if isinstance(ckpt, dict):
+        used = None
+        if state_key == "auto":
+            if "backbone_state" in ckpt and isinstance(ckpt["backbone_state"], dict):
+                used = "backbone_state"
+            elif "model_state" in ckpt and isinstance(ckpt["model_state"], dict):
+                used = "model_state"
+            else:
+                used = "state_dict_root"
+        else:
+            used = state_key
+        print(f"[INFO] 使用 checkpoint state: {used}")
 
-    for epoch in range(1, args.epochs + 1):
-        print(f"\n===== Epoch {epoch} =====")
+    return model
 
-        train_loss = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            mask_ratio=args.mask_ratio,
-            mask_mode=args.mask_mode,
+
+def esm_embed_sequence(seq: str, model_name: str, repr_layer: int, device: torch.device) -> np.ndarray:
+    """
+    对单条蛋白序列计算 ESM-2 残基级 embedding，返回 shape=[L, D] 的 numpy 数组。
+    """
+    if len(seq) == 0:
+        raise RuntimeError("ESM: 输入序列长度为 0")
+
+    print(f"ESM: 使用模型 {model_name}, 序列长度 L={len(seq)}")
+    esm_model, alphabet = getattr(esm.pretrained, model_name)()
+    esm_model.eval()
+    esm_model.to(device)
+    batch_converter = alphabet.get_batch_converter()
+
+    data = [("pdb_seq", seq)]
+    _, _, tokens = batch_converter(data)
+    tokens = tokens.to(device)
+
+    with torch.no_grad():
+        out = esm_model(tokens, repr_layers=[repr_layer], return_contacts=False)
+        reps = out["representations"][repr_layer][0]  # [L_token, D]
+
+    residue_emb = reps[1: 1 + len(seq)].cpu().numpy()  # 去掉 BOS
+    return residue_emb
+
+
+def esm_embed_pdb_residues(residues, model_name: str, repr_layer: int, device: torch.device):
+    """
+    作用:
+        从 PDB residues 构造序列并提取 ESM embedding
+    输出:
+        esm_seq: str
+        esm_residue_emb: np.ndarray [L, D]
+    """
+    # residues -> sequence (使用 build_graphs_global 的逻辑一般更稳，但这里保持你原实现风格)
+    # 由于你项目里 build_pdb_seq_and_keys/对齐逻辑可能较复杂，这里采用 build_pdb_to_esm_mapping 前置所需的 seq
+    seq_chars = []
+    for r in residues:
+        aa = r.get_resname()
+        # 这里不做复杂三字母->一字母映射，依赖 build_pdb_to_esm_mapping 的对齐能力
+        # 如果你后续希望更严格，可以引入你项目已有的三字母->一字母表
+        # 为避免预测脚本改动过大，这里保留你的现状：让 mapping 函数承担对齐
+        # 但 ESM 必须有序列，因此简单用 X 占位会导致 embedding 无意义
+        # 所以建议：你的 build_pdb_to_esm_mapping 已实现基于真实序列的对齐，否则这里需接入你已有的 build_pdb_seq_and_keys
+        # ——由于你说 AA 顺序已无问题，此处不扩展，保持最小改动：
+        seq_chars.append("X")
+    esm_seq = "".join(seq_chars)
+
+    # 如果全是 X，ESM embedding 无意义；此处给出显式报错提示你应接入项目内的序列构建函数
+    if set(esm_seq) == {"X"}:
+        raise RuntimeError(
+            "当前 predict.py 的 esm_embed_pdb_residues 使用了占位序列 'X'*L，无法得到有效 ESM embedding。\n"
+            "请把你项目内用于构图的真实序列构建函数接入（例如 build_pdb_seq_and_keys）。\n"
+            "你之前能正常预测，说明你本地 src/predict.py 很可能已有该实现；请以你本地版本为准合并本次的 checkpoint 兼容改动。"
         )
-        val_loss, val_acc = evaluate(
-            model,
-            val_loader,
-            device,
-            mask_ratio=args.mask_ratio,
-            mask_mode=args.mask_mode,
+
+    esm_residue_emb = esm_embed_sequence(esm_seq, model_name, repr_layer, device)
+    return esm_seq, esm_residue_emb
+
+
+def build_graph_from_pdb(
+    pdb_path: str,
+    uid: str,
+    esm_model_name: str,
+    repr_layer: int,
+    sub_resname: str,
+    tpp_resname: str,
+    protein_cutoff: float,
+    prot_lig_cutoff: float,
+    rbf_k: int,
+    rbf_max_dist: float,
+    graph_mode: str,
+    device: torch.device,
+):
+    """
+    直接从单个 PDB 构建图 (在内存中), 支持 pocket/global 两种模式。
+    """
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure(uid, pdb_path)
+    residues = collect_protein_residues(structure)
+    if not residues:
+        raise RuntimeError(f"{uid}: 未在 PDB 中找到蛋白残基")
+
+    # 1) ESM embedding（注意：你本地 predict.py 若已有真实序列构建，请保留你本地实现）
+    esm_seq, esm_residue_emb = esm_embed_pdb_residues(
+        residues=residues,
+        model_name=esm_model_name,
+        repr_layer=repr_layer,
+        device=device,
+    )
+
+    # 2) PDB <-> ESM 映射
+    esm_mapping = build_pdb_to_esm_mapping(residues, esm_seq)
+    if not esm_mapping:
+        raise RuntimeError(f"{uid}: PDB 与 ESM 序列对齐失败")
+
+    # 3) 识别口袋残基（用于 pocket_mask；即使 score-scope=global 也保留 pocket_mask 字段）
+    pocket_simple = identify_pocket_residues(
+        structure=structure,
+        residues=residues,
+        sub_resname=sub_resname,
+        core_cutoff=4.5,
+        contact_cutoff=5.0,
+        shell_hops=1,
+    )
+    if not pocket_simple:
+        raise RuntimeError(f"{uid}: 未识别到 pocket 残基")
+
+    # 4) 构图
+    graph = build_graph_for_uid(
+        uid=uid,
+        structure=structure,
+        residues=residues,
+        pocket_simple=pocket_simple,
+        sub_resname=sub_resname,
+        tpp_resname=tpp_resname,
+        protein_cutoff=protein_cutoff,
+        prot_lig_cutoff=prot_lig_cutoff,
+        rbf_k=rbf_k,
+        rbf_max_dist=rbf_max_dist,
+        esm_residue_emb=esm_residue_emb,
+        esm_mapping=esm_mapping,
+        graph_mode=graph_mode,
+    )
+    if graph is None:
+        raise RuntimeError(f"{uid}: 构图失败")
+    return graph
+
+
+def score_sites(
+    uid: str,
+    graph: dict,
+    model: MutPredV2Model,
+    device: torch.device,
+    score_scope: str = "pocket",
+    top_sites: int = 20,
+    top_k_aa: int = 5,
+) -> List[List[str]]:
+    """
+    对一个图的蛋白残基打分（pocket/global 由 score_scope 决定），返回排序后的若干行(每行是一个字段列表)。
+    """
+    x = graph["x"].to(device)
+    x_esm = graph["x_esm"].to(device)
+    pos = graph["pos"].to(device)
+    edge_index = graph["edge_index"].to(device)
+    edge_attr = graph["edge_attr"].to(device)
+    node_type = graph["node_type"].to(device)
+    pocket_mask = graph["pocket_mask"].to(device)
+    node_chain_idx = graph["node_chain_idx"]
+    node_resseq = graph["node_resseq"]
+
+    is_protein = (node_type == NODE_TYPE_PROTEIN)
+    if score_scope == "pocket":
+        sel_mask = is_protein & pocket_mask
+    else:
+        sel_mask = is_protein
+
+    indices = sel_mask.nonzero(as_tuple=False).view(-1).tolist()
+    results = []
+
+    for idx in indices:
+        i = int(idx)
+
+        # 原氨基酸
+        aa_onehot = x[i, :AA_DIM].detach().cpu()
+        aa_idx = int(aa_onehot.argmax().item())
+        native_aa = AA_TYPES_1[aa_idx] if 0 <= aa_idx < len(AA_TYPES_1) else "X"
+
+        # 构造 mask 副本
+        x_masked = x.clone()
+        x_esm_masked = x_esm.clone()
+        x_masked[i, :AA_DIM] = 0.0
+        x_esm_masked[i] = 0.0
+
+        with torch.no_grad():
+            logits = model(x_masked, x_esm_masked, edge_index, edge_attr, pos)  # [N, 20]
+            log_probs = F.log_softmax(logits[i], dim=-1)  # [20]
+            probs = log_probs.exp()
+
+        logP_native = float(log_probs[aa_idx].item())
+
+        # 最佳替代氨基酸 (排除原氨基酸)
+        probs_np = probs.detach().cpu().numpy()
+        probs_np_excl = probs_np.copy()
+        probs_np_excl[aa_idx] = -1.0
+        best_alt_idx = int(probs_np_excl.argmax())
+        best_alt_aa = AA_TYPES_1[best_alt_idx] if 0 <= best_alt_idx < len(AA_TYPES_1) else "X"
+        logP_best_alt = float(log_probs[best_alt_idx].item())
+
+        # score = logP(mut) - logP(wt)
+        score = logP_best_alt - logP_native
+
+        # 熵
+        entropy = float(-(probs * log_probs).sum().item())
+
+        # top-k
+        k = min(top_k_aa, AA_DIM)
+        topv, topi = probs.topk(k, dim=-1)
+        topv = topv.cpu().tolist()
+        topi = topi.cpu().tolist()
+
+        chain_idx = int(node_chain_idx[i].item())
+        resseq = int(node_resseq[i].item())
+
+        results.append(
+            {
+                "uid": uid,
+                "node_idx": i,
+                "chain_idx": chain_idx,
+                "resseq": resseq,
+                "native_aa": native_aa,
+                "logP_native": logP_native,
+                "best_alt_aa": best_alt_aa,
+                "logP_best_alt": logP_best_alt,
+                "score": score,
+                "entropy": entropy,
+                "top_i": topi,
+                "top_v": topv,
+            }
         )
 
-        print(f"Train loss: {train_loss:.4f}")
-        print(f"Val   loss: {val_loss:.4f}, Val masked acc: {val_acc:.4f}")
+    results.sort(key=lambda d: d["score"], reverse=True)
+    results = results[:top_sites]
 
-        # 追加到 CSV
-        with open(log_path, "a") as f:
-            f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{val_acc:.6f}\n")
+    rows: List[List[str]] = []
+    for r in results:
+        row = [
+            r["uid"],
+            str(r["node_idx"]),
+            str(r["chain_idx"]),
+            str(r["resseq"]),
+            r["native_aa"],
+            f"{r['logP_native']:.6f}",
+            r["best_alt_aa"],
+            f"{r['logP_best_alt']:.6f}",
+            f"{r['score']:.6f}",
+            f"{r['entropy']:.6f}",
+        ]
+        for aa_id, p in zip(r["top_i"], r["top_v"]):
+            aa_letter = AA_TYPES_1[aa_id] if 0 <= aa_id < len(AA_TYPES_1) else "X"
+            row.append(aa_letter)
+            row.append(f"{p:.6f}")
+        rows.append(row)
+    return rows
 
-        # 存到内存里用于画图
-        epoch_list.append(epoch)
-        train_hist.append(train_loss)
-        val_hist.append(val_loss)
-        acc_hist.append(val_acc)
 
-        # 只保存最优模型
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "args": vars(args),
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                },
-                best_path,
-            )
-            print(f"发现更优模型, 已保存到: {best_path}")
+def main():
+    parser = argparse.ArgumentParser(description="End-to-end mutation site suggestion for a single PDB")
 
-    print(f"\n训练结束. 最优 epoch = {best_epoch}, 最优 val_loss = {best_val_loss:.4f}")
-    print(f"最终模型路径: {best_path}")
-    print(f"训练日志已写入: {log_path}")
+    parser.add_argument("--pdb", type=str, required=True, help="输入的 holo PDB 文件路径")
+    parser.add_argument("--checkpoint", type=str, required=True, help="MutPred_v2 checkpoint 路径")
+    parser.add_argument(
+        "--state-key",
+        type=str,
+        default="auto",
+        choices=["auto", "backbone_state", "model_state"],
+        help="从 checkpoint 中取 backbone 权重的 key（auto 优先 backbone_state，其次 model_state）",
+    )
 
-    # 画 loss 曲线
-    if len(epoch_list) > 0:
-        plt.figure()
-        plt.plot(epoch_list, train_hist, label="train_loss")
-        plt.plot(epoch_list, val_hist, label="val_loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.title("Training / Validation Loss")
-        plt.legend()
-        loss_fig_path = os.path.join(args.save_dir, "loss_curve.png")
-        plt.savefig(loss_fig_path, dpi=200)
-        plt.close()
-        print(f"loss 曲线已保存到: {loss_fig_path}")
+    parser.add_argument("--out-dir", type=str, required=True, help="候选突变位点输出 CSV 文件夹路径")
+    parser.add_argument("--model-name", type=str, default="esm2_t36_3B_UR50D", help="ESM-2 模型名称")
+    parser.add_argument("--repr-layer", type=int, default=36, help="ESM 使用的层编号")
 
-        # 画 val_acc 曲线
-        plt.figure()
-        plt.plot(epoch_list, acc_hist, label="val_acc")
-        plt.xlabel("Epoch")
-        plt.ylabel("Val masked accuracy")
-        plt.title("Validation Masked Accuracy")
-        plt.legend()
-        acc_fig_path = os.path.join(args.save_dir, "acc_curve.png")
-        plt.savefig(acc_fig_path, dpi=200)
-        plt.close()
-        print(f"accuracy 曲线已保存到: {acc_fig_path}")
+    parser.add_argument("--sub-resname", type=str, default="l02", help="底物 resName")
+    parser.add_argument("--tpp-resname", type=str, default="l01", help="TPP resName")
+    parser.add_argument("--protein-cutoff", type=float, default=8.0, help="蛋白-蛋白 Cα 聚边距离阈值 (Å)")
+    parser.add_argument("--prot-lig-cutoff", type=float, default=5.0, help="蛋白-配体/TPP/Mg 聚边距离阈值 (Å)")
+    parser.add_argument("--rbf-k", type=int, default=16, help="RBF 边特征维度")
+    parser.add_argument("--rbf-max-dist", type=float, default=15.0, help="RBF 最大距离 (Å)")
+
+    parser.add_argument("--top-sites", type=int, default=20, help="输出候选突变位点数量")
+    parser.add_argument("--top-k-aa", type=int, default=5, help="每个位点输出前多少个推荐 AA")
+
+    parser.add_argument(
+        "--graph-mode",
+        type=str,
+        default="global",
+        choices=["pocket", "global"],
+        help="与训练时使用的图模式保持一致: pocket 或 global",
+    )
+    parser.add_argument(
+        "--score-scope",
+        type=str,
+        default="pocket",
+        choices=["pocket", "global"],
+        help="打分范围: pocket 或 global",
+    )
+
+    parser.add_argument("--device", type=str, default="auto", help="cpu / cuda / auto")
+    args = parser.parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"使用设备: {device}")
+
+    if not os.path.isfile(args.pdb):
+        raise FileNotFoundError(f"PDB 文件不存在: {args.pdb}")
+    uid = os.path.splitext(os.path.basename(args.pdb))[0]
+
+    print(f"加载 MutPred_v2 模型: {args.checkpoint}")
+    model = load_mutpred_model(args.checkpoint, device, state_key=args.state_key)
+
+    print(f"从 PDB 构建图 ({args.graph_mode} 模式): {args.pdb}")
+    graph = build_graph_from_pdb(
+        pdb_path=args.pdb,
+        uid=uid,
+        esm_model_name=args.model_name,
+        repr_layer=args.repr_layer,
+        sub_resname=args.sub_resname,
+        tpp_resname=args.tpp_resname,
+        protein_cutoff=args.protein_cutoff,
+        prot_lig_cutoff=args.prot_lig_cutoff,
+        rbf_k=args.rbf_k,
+        rbf_max_dist=args.rbf_max_dist,
+        graph_mode=args.graph_mode,
+        device=device,
+    )
+
+    print(f"对残基打分并排序（score_scope={args.score_scope}）...")
+    rows = score_sites(
+        uid=uid,
+        graph=graph,
+        model=model,
+        device=device,
+        score_scope=args.score_scope,
+        top_sites=args.top_sites,
+        top_k_aa=args.top_k_aa,
+    )
+
+    header = [
+        "uid",
+        "node_idx",
+        "chain_idx",
+        "resseq",
+        "native_aa",
+        "logP_native",
+        "best_alt_aa",
+        "logP_best_alt",
+        "score",
+        "entropy",
+    ]
+    for k in range(1, args.top_k_aa + 1):
+        header.append(f"top{k}_aa")
+        header.append(f"top{k}_p")
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_csv = os.path.join(args.out_dir, f"{uid}_mut_suggest.csv")
+
+    with open(out_csv, "w") as f:
+        f.write(",".join(header) + "\n")
+        for row in rows:
+            f.write(",".join(row) + "\n")
+
+    print(f"完成. 结果已写入: {out_csv}")
 
 
 if __name__ == "__main__":
